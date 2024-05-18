@@ -4,16 +4,18 @@
 import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+from utils.data_utils import write_logs
 
 
-def pooling(outputs, inputs, strategy):
+def pooling(outputs, inputs, strategy, normalize):
     if strategy == 'cls':
         outputs = outputs[:, 0]
     elif strategy == 'mean':
         outputs = torch.sum(outputs * inputs["attention_mask"][:, :, None], dim=1) / torch.sum(inputs["attention_mask"])
     else:
         raise NotImplementedError
-    # outputs = F.normalize(outputs, p=2, dim=1)
+    if normalize:
+        outputs = F.normalize(outputs, p=2, dim=1)
     return outputs
 
 
@@ -22,18 +24,22 @@ def train_epoch(train_dataloader, accelerator, unet, text_encoder, noise_schedul
     train_loss = 0.0
     for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(unet):
-            encoder_hidden_states = text_encoder(batch["question_ids"]).last_hidden_state
-            encoder_hidden_states = pooling(encoder_hidden_states, batch["question_ids"], 'cls')
-            para_hidden_states = text_encoder(batch["para_ids"]).last_hidden_state
-            para_hidden_states = pooling(para_hidden_states, batch["para_ids"], 'cls')
+            query_embeddings = text_encoder(batch["question_ids"]).last_hidden_state
+            query_embeddings = pooling(query_embeddings, batch["question_ids"], 'cls', args.normalize)
+            pos_para_embeddings = text_encoder(batch["para_ids"]).last_hidden_state
+            pos_para_embeddings = pooling(pos_para_embeddings, batch["para_ids"], 'cls', args.normalize)
+            # neg_para_embeddings = text_encoder(batch["neg_ids"]).last_hidden_state
+            # neg_para_embeddings = pooling(neg_para_embeddings, batch["neg_ids"], 'cls', args.normalize)
+            bsz = query_embeddings.shape[0]
 
-            latents = para_hidden_states.unsqueeze(1)
+            latents = pos_para_embeddings.unsqueeze(1)
             latents = latents.unsqueeze(1)
-            encoder_hidden_states = encoder_hidden_states.unsqueeze(1)
-
+            query_embeddings = query_embeddings.unsqueeze(1)
             noise = torch.randn_like(latents)
-            # noise = F.normalize(noise, p=2, dim=3)
-            bsz = latents.shape[0]
+
+            if args.normalize:
+                noise = F.normalize(noise, p=2, dim=3)
+
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
 
@@ -46,9 +52,10 @@ def train_epoch(train_dataloader, accelerator, unet, text_encoder, noise_schedul
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+            model_pred = unet(noisy_latents, timesteps, query_embeddings, return_dict=False)[0]
 
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
             train_loss += avg_loss.item()
 
@@ -57,7 +64,6 @@ def train_epoch(train_dataloader, accelerator, unet, text_encoder, noise_schedul
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-
             progress_bar.update(1)
             train_loss = 0.0
 
@@ -65,52 +71,64 @@ def train_epoch(train_dataloader, accelerator, unet, text_encoder, noise_schedul
             progress_bar.set_postfix(**logs)
 
 
-def test_epoch(test_dataloader, unet, accelerator, noise_scheduler, text_encoder):
+def test_epoch(test_dataloader, unet, accelerator, noise_scheduler, text_encoder, normalize, log_file, logger):
     total_correct_diff, total_correct_base, num_samples = 0, 0, 0
+    dist_query_to_pred, dist_query_to_pos, dist_query_to_neg, dist_pred_to_pos, dist_pred_to_neg = [], [], [], [], []
+    sim_pos, sim_neg, sim_pos_base, sim_neg_base = [], [], [], []
     for batch in tqdm(test_dataloader):
-        encoder_hidden_states = text_encoder(batch["question_ids"].to(accelerator.device)).last_hidden_state
-        encoder_hidden_states = pooling(encoder_hidden_states, batch["question_ids"], 'cls')
-        para_hidden_states = text_encoder(batch["para_ids"].to(accelerator.device)).last_hidden_state
-        para_hidden_states = pooling(para_hidden_states, batch["para_ids"], 'cls')
+        query_embeddings = text_encoder(batch["question_ids"].to(accelerator.device)).last_hidden_state
+        query_embeddings = pooling(query_embeddings, batch["question_ids"], 'cls', normalize)
+        pos_para_embeddings = text_encoder(batch["para_ids"].to(accelerator.device)).last_hidden_state
+        pos_para_embeddings = pooling(pos_para_embeddings, batch["para_ids"], 'cls', normalize)
+        neg_para_embeddings = text_encoder(batch["neg_ids"].to(accelerator.device)).last_hidden_state
+        neg_para_embeddings = pooling(neg_para_embeddings, batch["neg_ids"], 'cls', normalize)
+        bsz = query_embeddings.shape[0]
 
-        pos_embeds = para_hidden_states
+        query_embeddings = query_embeddings.unsqueeze(1)
+        pos_para_embeddings = pos_para_embeddings.unsqueeze(1)
+        pos_para_embeddings = pos_para_embeddings.unsqueeze(1)
 
-        neg_embeds = text_encoder(batch["neg_ids"].to(accelerator.device)).last_hidden_state
-        neg_embeds = pooling(neg_embeds, batch["neg_ids"], 'cls')
+        latents = torch.randn_like(pos_para_embeddings)
+        if normalize:
+            latents = F.normalize(latents, p=2, dim=3)
 
-        encoder_hidden_states = encoder_hidden_states.unsqueeze(1)
-
-        para_hidden_states = para_hidden_states.unsqueeze(1)
-        para_hidden_states = para_hidden_states.unsqueeze(1)
-        latents = torch.randn_like(para_hidden_states)
-        # latents = F.normalize(latents, p=2, dim=3)
         for t in noise_scheduler.timesteps:
             with torch.no_grad():
-                noise_pred = unet(latents, t, encoder_hidden_states, return_dict=False)[0]
+                noise_pred = unet(latents, t, query_embeddings, return_dict=False)[0]
 
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
-            if t == 1:
-                latents = noise_scheduler.step(noise_pred, t, latents).pred_original_sample
-                break
-            else:
-                latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
-        model_pred = latents.squeeze()
-        # model_pred = F.normalize(model_pred, p=2, dim=1)
-        query_embeds = encoder_hidden_states.squeeze()
 
-        pos_scores = F.cosine_similarity(model_pred, pos_embeds, dim=1)
-        neg_scores = F.cosine_similarity(model_pred, neg_embeds, dim=1)
+        model_pred = latents.squeeze()
+
+        if normalize:
+            model_pred = F.normalize(model_pred, p=2, dim=1)
+        query_embeddings = query_embeddings.squeeze()
+        pos_para_embeddings = pos_para_embeddings.squeeze()
+
+        pos_scores = F.cosine_similarity(model_pred, pos_para_embeddings, dim=1)
+        neg_scores = F.cosine_similarity(model_pred, neg_para_embeddings, dim=1)
         more_similar = pos_scores > neg_scores
         num_correct = more_similar.sum().item()
         total_correct_diff = total_correct_diff + num_correct
 
-        pos_base_scores = F.cosine_similarity(query_embeds, pos_embeds, dim=1)
-        neg_base_scores = F.cosine_similarity(query_embeds, neg_embeds, dim=1)
+        pos_base_scores = F.cosine_similarity(query_embeddings, pos_para_embeddings, dim=1)
+        neg_base_scores = F.cosine_similarity(query_embeddings, neg_para_embeddings, dim=1)
         more_similar_base = pos_base_scores > neg_base_scores
         num_correct_base = more_similar_base.sum().item()
         total_correct_base = total_correct_base + num_correct_base
 
-        bsz = query_embeds.shape[0]
         num_samples = num_samples + bsz
 
-    return total_correct_diff, total_correct_base, num_samples
+        dist_query_to_pred.append(torch.mean((query_embeddings - model_pred) ** 2).item())
+        dist_query_to_pos.append(torch.mean((query_embeddings - pos_para_embeddings) ** 2).item())
+        dist_query_to_neg.append(torch.mean((query_embeddings - neg_para_embeddings) ** 2).item())
+        dist_pred_to_pos.append(torch.mean((model_pred - pos_para_embeddings) ** 2).item())
+        dist_pred_to_neg.append(torch.mean((model_pred - neg_para_embeddings) ** 2).item())
+        sim_pos.append(torch.mean(pos_scores).item())
+        sim_neg.append(torch.mean(neg_scores).item())
+        sim_pos_base.append(torch.mean(pos_base_scores).item())
+        sim_neg_base.append(torch.mean(neg_base_scores).item())
+
+    write_logs(total_correct_diff, total_correct_base, num_samples, dist_query_to_pred, dist_query_to_pos,
+               dist_query_to_neg, dist_pred_to_pos, dist_pred_to_neg, sim_pos, sim_neg, sim_pos_base, sim_neg_base,
+               log_file, logger)

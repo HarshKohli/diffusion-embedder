@@ -25,10 +25,11 @@ def parse_args():
                         help="Base embedding model for query/passage.")
     parser.add_argument("--embedding_size", type=int, default=768, help="Embedding dimensions of the text encoder.")
     parser.add_argument("--max_tokens", type=int, default=512, help="Embedding dimensions of the text encoder.")
+    parser.add_argument("--log_file", type=str, default='logs/logs8.txt', help="Log file.")
 
     parser.add_argument("--train_batch_size", type=int, default=64, help="Batch size for training.")
-    parser.add_argument("--train_epochs", type=int, default=5, help="Total training epochs.")
-    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Initial learning rate (after warmup).")
+    parser.add_argument("--train_epochs", type=int, default=500, help="Total training epochs.")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Initial learning rate (after warmup).")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
@@ -42,6 +43,7 @@ def parse_args():
                                  'constant_with_warmup'], help='The learning rate scheduler type to use.')
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Number of warmup steps in the lr scheduler.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--normalize", default=False, type=bool, help="Normalize embeddings everywhere.")
 
     parser.add_argument("--output_dir", type=str, default="outputs", help="Output directory for logs and checkpoints.")
     parser.add_argument("--logging_dir", type=str, default="logs", help="TensorBoard log directory.")
@@ -94,7 +96,7 @@ def main():
     test_dataset = all_datasets["test"].with_transform(lambda x: preprocess_test_dataset(x, tokenizer, args.max_tokens))
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
+        test_dataset,
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
@@ -145,11 +147,9 @@ def main():
         train_epoch(train_dataloader, accelerator, unet, text_encoder, noise_scheduler, args, optimizer, lr_scheduler,
                     progress_bar)
         logger.info("***** Running validation *****")
-        total_correct_diff, total_correct_base, num_samples = test_epoch(test_dataloader, unet, accelerator,
-                                                                         noise_scheduler, text_encoder)
-        logger.info(f"Total correct (diff): {total_correct_diff}")
-        logger.info(f"Total correct (base): {total_correct_base}")
-        logger.info(f"Number of samples processed: {num_samples}")
+        test_epoch(test_dataloader, unet, accelerator, noise_scheduler, text_encoder, args.normalize, args.log_file,
+                   logger)
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
