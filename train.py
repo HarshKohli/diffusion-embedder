@@ -13,7 +13,7 @@ from transformers import AutoModel, AutoTokenizer
 from diffusers.optimization import get_scheduler
 from diffusers import UNet2DConditionModel, DDPMScheduler
 from utils.data_utils import load_all_datasets, preprocess_dataset, preprocess_test_dataset, collate_fn
-from utils.torch_utils import test_epoch, train_epoch
+from utils.torch_utils import test_epoch, train_epoch, DiffusionMLP
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -23,7 +23,12 @@ def parse_args():
 
     parser.add_argument("--embedding_model_path", type=str, default='Alibaba-NLP/gte-base-en-v1.5',
                         help="Base embedding model for query/passage.")
+    parser.add_argument("--model_type", type=str, default="unet", choices=["mlp", "unet"],
+                        help="Model type for noise prediction.")
     parser.add_argument("--embedding_size", type=int, default=768, help="Embedding dimensions of the text encoder.")
+    parser.add_argument("--time_embedding_size", type=int, default=32,
+                        help="Time embedding dimensions for custom models.")
+
     parser.add_argument("--max_tokens", type=int, default=512, help="Embedding dimensions of the text encoder.")
     parser.add_argument("--log_file", type=str, default='logs/logs8.txt', help="Log file.")
 
@@ -74,17 +79,22 @@ def main():
     noise_scheduler.set_timesteps(args.num_inference_steps)
     tokenizer = AutoTokenizer.from_pretrained(args.embedding_model_path)
     text_encoder = AutoModel.from_pretrained(args.embedding_model_path, trust_remote_code=True).cuda()
-    unet = UNet2DConditionModel(
-        in_channels=1, out_channels=1, cross_attention_dim=args.embedding_size,
-        block_out_channels=[32, 64, 128, 256]
-    )
+
+    if args.model_type == 'unet':
+        model = UNet2DConditionModel(
+            in_channels=1, out_channels=1, cross_attention_dim=args.embedding_size,
+            block_out_channels=[32, 64, 128, 256]
+        )
+    else:
+        model = DiffusionMLP(args.num_train_timesteps, args.time_embedding_size, args.embedding_size,
+                             args.embedding_size)
 
     text_encoder.requires_grad_(False)
-    unet.train()
+    model.train()
     torch.backends.cuda.matmul.allow_tf32 = True
     optimizer_cls = torch.optim.AdamW
     optimizer = optimizer_cls(
-        unet.parameters(),
+        model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -119,7 +129,7 @@ def main():
         num_training_steps=max_train_steps,
     )
 
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader,
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader,
                                                                           lr_scheduler)
 
     weight_dtype = torch.float32
@@ -148,7 +158,7 @@ def main():
                     progress_bar)
         logger.info("***** Running validation *****")
         test_epoch(test_dataloader, unet, accelerator, noise_scheduler, text_encoder, args.normalize, args.log_file,
-                   logger)
+                   logger, args.model_type)
     accelerator.end_training()
 
 
